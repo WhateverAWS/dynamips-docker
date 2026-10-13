@@ -1,0 +1,122 @@
+name: Dynamips image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*-r*']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check (${{ matrix.arch }})
+    if: github.ref_type != 'tag'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build --platform linux/${{ matrix.arch }} --pull -t dynamips:check .
+      - name: Check image platform
+        run: test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' dynamips:check)" = "linux/${{ matrix.arch }}"
+      - name: Start Dynamips
+        id: start
+        run: docker run -d --name dynamips-check dynamips:check
+      - name: Check Hypervisor
+        run: |
+          docker run --rm --network container:dynamips-check \
+            ghcr.io/jwilder/dockerize:v0.15.2 \
+              -wait tcp://127.0.0.1:7200 -timeout 30s -wait-retry-interval 2s
+      - name: Show diagnostics on failure
+        if: failure() && steps.start.outcome == 'success'
+        run: |
+          docker logs dynamips-check
+          docker inspect --format '{{json .State}}' dynamips-check
+      - name: Clean up
+        if: always() && steps.start.outcome == 'success'
+        run: docker rm -f dynamips-check
+
+  release:
+    name: Release (${{ matrix.arch }})
+    if: github.ref_type == 'tag'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build --platform linux/${{ matrix.arch }} --pull --no-cache -t dynamips:check .
+      - name: Check image platform
+        run: test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' dynamips:check)" = "linux/${{ matrix.arch }}"
+      - name: Start Dynamips
+        id: start
+        run: docker run -d --name dynamips-check dynamips:check
+      - name: Check Hypervisor
+        run: |
+          docker run --rm --network container:dynamips-check \
+            ghcr.io/jwilder/dockerize:v0.15.2 \
+            -wait tcp://127.0.0.1:7200 -timeout 30s -wait-retry-interval 2s
+      - name: Show diagnostics on failure
+        if: failure() && steps.start.outcome == 'success'
+        run: |
+          docker logs dynamips-check
+          docker inspect --format '{{json .State}}' dynamips-check
+      - name: Clean up
+        if: always() && steps.start.outcome == 'success'
+        run: docker rm -f dynamips-check
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dynamips:${GITHUB_REF_NAME#v}-${{ matrix.arch }}"
+          docker tag dynamips:check "$image"
+          docker push "$image"
+
+  publish:
+    name: Publish manifests
+    needs: release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-26.04
+    permissions:
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish manifests
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dynamips"
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create \
+            --tag "$image:$version" \
+            --tag "$image:latest" \
+            "$image:$version-amd64" \
+            "$image:$version-arm64"
+      - name: Check manifests
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dynamips"
+          for tag in "${GITHUB_REF_NAME#v}" latest; do
+            docker buildx imagetools inspect --raw "$image:$tag" |
+              jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]'
+          done
